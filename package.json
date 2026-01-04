@@ -1,14 +1,14 @@
 {
   "name": "looker-export-service",
   "version": "1.0.0",
-  "description": "HTTP service to export public Looker Studio report as PDF using Playwright",
+  "description": "Serviço HTTP para exportar relatório público do Looker Studio como PDF usando Playwright",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "express": "^4.19.2",
+    "express": "^4.18.2",
     "playwright": "^1.42.1"
   }
 }
