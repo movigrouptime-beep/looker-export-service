@@ -1,0 +1,10 @@
+version: "3.8"
+services:
+  looker-export:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      - API_KEY=COLOQUE_UMA_CHAVE_FORTE_AQUI
+    restart: unless-stopped
