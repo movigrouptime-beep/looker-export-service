@@ -1,164 +1,174 @@
-// server.js (trecho da função export)
-// Playwright já está no container (mcr.microsoft.com/playwright)
+// export-looker.js
+// npm i playwright
+// node export-looker.js
 
-const { chromium } = require('playwright');
-const fs = require('fs');
+const { chromium } = require("playwright");
+const path = require("path");
 
-async function exportLookerPDF({ looker_url, client_name, start_date, end_date }) {
+async function waitForReportReady(page) {
+  // Looker costuma carregar “meio vazio” e depois preencher.
+  // Aqui a gente espera algum card sair de "2.1" / "Não há dados" trocar ou estabilizar.
+  // Ajuste se quiser.
+  await page.waitForTimeout(2000);
+  await page.waitForLoadState("domcontentloaded");
+  await page.waitForTimeout(4000);
+}
+
+async function openAccountDropdown(page) {
+  // “Conta de Anúncio” é um controle no topo. Tentamos por texto visível.
+  const header = page.getByText(/Conta de Anúncio/i).first();
+  await header.scrollIntoViewIfNeeded();
+  await header.click({ timeout: 30000 });
+}
+
+async function clearAllAccounts(page) {
+  // No dropdown aparece um “checkbox” geral no topo (selecionar tudo / limpar tudo).
+  // Pela sua imagem ele fica no canto superior esquerdo da lista.
+  // Tentativa 1: clicar no primeiro checkbox visível dentro do popup.
+  const popup = page.locator('mat-option, [role="listbox"], .mat-mdc-select-panel, .cdk-overlay-pane').last();
+
+  // às vezes o overlay é outro container; então também tentamos pelo checkbox “genérico”
+  const firstCheckbox = popup.locator('input[type="checkbox"], [role="checkbox"]').first();
+  await firstCheckbox.click({ timeout: 15000 });
+
+  // Pequena pausa pro Looker aplicar filtro
+  await page.waitForTimeout(800);
+}
+
+async function selectClientAccount(page, clientLabel) {
+  // Você comentou que na lista aparece "CA 01 - Nome"
+  // então passe clientLabel já no mesmo formato, ex: "CA 01 - Patricia Salmazo"
+
+  const overlay = page.locator(".cdk-overlay-pane, .mat-mdc-select-panel, [role='dialog']").last();
+
+  // campo “Digite para pesquisar”
+  const search = overlay.getByPlaceholder(/Digite para pesquisar/i).or(
+    overlay.locator("input").first()
+  );
+
+  await search.fill("");
+  await search.type(clientLabel, { delay: 30 });
+
+  // clica no item que contém o texto do cliente
+  const item = overlay.getByText(new RegExp(clientLabel.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i")).first();
+  await item.click({ timeout: 20000 });
+
+  // aguarda aplicar
+  await page.waitForTimeout(1200);
+
+  // fecha o dropdown (ESC costuma funcionar)
+  await page.keyboard.press("Escape").catch(() => {});
+}
+
+async function openPeriodPicker(page) {
+  const period = page.getByText(/Selecionar período/i).first();
+  await period.scrollIntoViewIfNeeded();
+  await period.click({ timeout: 30000 });
+}
+
+async function setPeriodDates(page, startDay, endDay) {
+  // O date picker do Looker abre com “Data de início” e “Data de término”
+  // e dias clicáveis. Seu fluxo: clicar dia início + clicar dia fim + Aplicar.
+
+  const dialog = page.locator("[role='dialog'], .mat-mdc-dialog-container, .cdk-overlay-pane").last();
+
+  // clica no dia inicial (ex: "1")
+  await dialog.getByRole("gridcell", { name: String(startDay) }).first().click({ timeout: 15000 });
+
+  // clica no dia final (ex: "31")
+  await dialog.getByRole("gridcell", { name: String(endDay) }).first().click({ timeout: 15000 });
+
+  // botão “Aplicar”
+  await dialog.getByRole("button", { name: /Aplicar/i }).click({ timeout: 15000 });
+
+  // aguarda o relatório recarregar
+  await page.waitForTimeout(6000);
+}
+
+async function downloadReport(page, saveAs = "report.pdf") {
+  // Clique no menu ⋮ (3 pontinhos) ao lado de compartilhar
+  // e depois “Baixar o relatório”
+
+  // abre o menu de 3 pontos
+  const menuBtn = page.locator("button").filter({ has: page.locator("svg") }).filter({ hasText: "" });
+  // mais confiável: procurar o botão com aria-label que geralmente existe
+  const dots = page.locator("button[aria-label*='Mais'], button[aria-label*='mais'], button[aria-label*='More'], button[aria-label*='more']").first();
+
+  if (await dots.count()) {
+    await dots.click({ timeout: 15000 });
+  } else {
+    // fallback: tenta achar pelo ícone “more_vert” do Material
+    await page.getByRole("button").filter({ hasText: "" }).locator("svg").first().click({ timeout: 15000 });
+  }
+
+  // clica “Baixar o relatório”
+  const downloadItem = page.getByText(/Baixar o relatório/i).first();
+
+  const [download] = await Promise.all([
+    page.waitForEvent("download", { timeout: 60000 }),
+    downloadItem.click({ timeout: 15000 }),
+  ]);
+
+  const outPath = path.resolve(process.cwd(), saveAs);
+  await download.saveAs(outPath);
+  return outPath;
+}
+
+async function main() {
+  // >>>>>>>>>>>> CONFIGURE AQUI
+  const lookerUrl = process.env.LOOKER_URL || "COLE_A_URL_DO_LOOKER_AQUI";
+  const clientName = process.env.CLIENT_NAME || "CA 01 - Patricia Salmazo";
+  const startDay = Number(process.env.START_DAY || "1");
+  const endDay = Number(process.env.END_DAY || "31");
+  const outputName = process.env.OUTPUT || "Relatorio.pdf";
+  // <<<<<<<<<<<<
+
   const browser = await chromium.launch({
-    headless: true,
-    args: ['--no-sandbox', '--disable-dev-shm-usage'],
+    headless: true, // no Render deve ser true
+    args: ["--no-sandbox", "--disable-dev-shm-usage"],
   });
 
   const context = await browser.newContext({
     acceptDownloads: true,
-    viewport: { width: 1440, height: 900 },
+    viewport: { width: 1366, height: 768 },
+    locale: "pt-BR",
   });
 
   const page = await context.newPage();
-
-  // helper: click com retry
-  async function clickRetry(locator, name, tries = 5) {
-    let lastErr;
-    for (let i = 0; i < tries; i++) {
-      try {
-        await locator.waitFor({ state: 'visible', timeout: 20000 });
-        await locator.click({ timeout: 20000 });
-        return;
-      } catch (e) {
-        lastErr = e;
-        await page.waitForTimeout(800 + i * 300);
-      }
-    }
-    throw new Error(`Falha ao clicar: ${name} -> ${lastErr?.message}`);
-  }
-
-  // helper: espera “recalcular”
-  // (ajuste o seletor de loading conforme seu Looker)
-  async function waitRecalc() {
-    // 1) espera um pouco para disparar requests
-    await page.waitForTimeout(1500);
-
-    // 2) tenta esperar sumir spinner/loading (se existir)
-    // exemplo genérico - você pode trocar pelo spinner real
-    const spinner = page.locator('[role="progressbar"], text=Carregando');
-    try {
-      if (await spinner.first().isVisible({ timeout: 2000 })) {
-        await spinner.first().waitFor({ state: 'hidden', timeout: 60000 });
-      }
-    } catch (_) {
-      // se não existir spinner, seguimos
-    }
-
-    // 3) “assenta” a UI
-    await page.waitForTimeout(1500);
-  }
+  page.setDefaultTimeout(60000);
 
   try {
-    // A) abrir
-    await page.goto(looker_url, { waitUntil: 'domcontentloaded', timeout: 90000 });
+    console.log("Abrindo:", lookerUrl);
+    await page.goto(lookerUrl, { waitUntil: "domcontentloaded" });
+    await waitForReportReady(page);
 
-    // espera algo “marcante” do relatório existir
-    // ajuste: pode ser o texto "Conta de Anúncio" ou "Selecionar período"
-    await page.locator('text=Conta de Anúncio').waitFor({ timeout: 90000 });
-    await page.locator('text=Selecionar período').waitFor({ timeout: 90000 });
-    await page.waitForTimeout(2000);
+    console.log("Abrindo filtro Conta de Anúncio...");
+    await openAccountDropdown(page);
 
-    // B) Conta de Anúncio
-    const btnConta = page.locator('text=Conta de Anúncio').first();
-    await clickRetry(btnConta, 'Conta de Anúncio');
+    console.log("Limpando seleção...");
+    await clearAllAccounts(page);
 
-    // caixa de busca dentro do dropdown
-    const buscaConta = page.locator('input[placeholder*="Digite para pesquisar"]').first();
-    await buscaConta.waitFor({ timeout: 20000 });
+    console.log("Selecionando cliente:", clientName);
+    await selectClientAccount(page, clientName);
+    await waitForReportReady(page);
 
-    // checkbox do topo (marcar/desmarcar todos)
-    // ⚠️ você precisa ajustar esse seletor: pode ser um checkbox com role=checkbox no topo
-    const checkboxTopo = page.locator('[role="checkbox"]').first();
-    await clickRetry(checkboxTopo, 'Checkbox topo (desmarcar tudo)');
+    console.log("Abrindo período...");
+    await openPeriodPicker(page);
 
-    // digita o cliente e seleciona
-    await buscaConta.fill(client_name);
-    await page.waitForTimeout(800);
+    console.log("Selecionando dias:", startDay, "até", endDay);
+    await setPeriodDates(page, startDay, endDay);
+    await waitForReportReady(page);
 
-    // item do cliente na lista (texto)
-    const itemCliente = page.locator(`text=${client_name}`).first();
-    await clickRetry(itemCliente, `Selecionar cliente: ${client_name}`);
-
-    // fecha dropdown
-    await page.keyboard.press('Escape');
-    await waitRecalc();
-
-    // C) Período
-    const btnPeriodo = page.locator('text=Selecionar período').first();
-    await clickRetry(btnPeriodo, 'Selecionar período');
-
-    // Se existir um dropdown "Período automático", você pode trocar pra "Personalizado"
-    // Ajuste conforme seu looker:
-    const modoPeriodo = page.locator('text=Período automático').first();
-    if (await modoPeriodo.isVisible().catch(() => false)) {
-      await clickRetry(modoPeriodo, 'Período automático');
-      // exemplo: escolher "Personalizado"
-      const personalizado = page.locator('text=Personalizado').first();
-      if (await personalizado.isVisible().catch(() => false)) {
-        await clickRetry(personalizado, 'Personalizado');
-      }
-    }
-
-    // ⚠️ Aqui é o ponto mais variável:
-    // O seu calendário mostra "Data de início" e "Data de término".
-    // Existem 2 jeitos:
-    // 1) se tiver input de data (melhor)
-    // 2) clicar nos dias no calendário (mais chato)
-
-    // tentativa 1: achar inputs (se existirem)
-    const inputInicio = page.locator('input[aria-label*="Data de início"], input[placeholder*="Data de início"]').first();
-    const inputFim = page.locator('input[aria-label*="Data de término"], input[placeholder*="Data de término"]').first();
-
-    if (await inputInicio.isVisible().catch(() => false) && await inputFim.isVisible().catch(() => false)) {
-      await inputInicio.fill(start_date);
-      await inputFim.fill(end_date);
-    } else {
-      // tentativa 2: clicar no calendário
-      // Você precisa adaptar: converter start_date/end_date em dia/mês e clicar nos botões do calendário.
-      // Como seu calendário é mensal, é comum usar:
-      // page.locator('text=4').click() etc (mas precisa escopo correto do calendário)
-      throw new Error('Não encontrei inputs de data. Precisa mapear cliques no calendário com seletores do seu Looker.');
-    }
-
-    // clicar Aplicar
-    const btnAplicar = page.locator('text=Aplicar').first();
-    await clickRetry(btnAplicar, 'Aplicar período');
-    await waitRecalc();
-
-    // D) baixar
-    // seta ao lado de "Compartilhar"
-    // ajuste: pode ser um botão com aria-label ou o menu de 3 pontos dependendo do tema
-    const btnMenuCompartilhar = page.locator('text=Compartilhar').first();
-    await clickRetry(btnMenuCompartilhar, 'Compartilhar');
-
-    const baixar = page.locator('text=Baixar o relatório').first();
-    await clickRetry(baixar, 'Baixar o relatório');
-
-    // Captura download
-    const download = await page.waitForEvent('download', { timeout: 90000 });
-    const path = await download.path();
-
-    if (!path) throw new Error('Download não gerou arquivo (path null).');
-
-    const buffer = fs.readFileSync(path);
-
-    await browser.close();
-    return buffer;
-
+    console.log("Baixando relatório...");
+    const saved = await downloadReport(page, outputName);
+    console.log("✅ Salvo em:", saved);
   } catch (err) {
-    // debug forte: screenshot + html
-    try { await page.screenshot({ path: '/tmp/erro.png', fullPage: true }); } catch {}
-    try {
-      const html = await page.content();
-      fs.writeFileSync('/tmp/erro.html', html);
-    } catch {}
-    await browser.close();
+    console.error("❌ ERRO:", err?.message || err);
+    await page.screenshot({ path: "debug.png", fullPage: true }).catch(() => {});
     throw err;
+  } finally {
+    await browser.close();
   }
 }
+
+main();
