@@ -1,8 +1,9 @@
 {
   "name": "looker-export-service",
   "version": "1.0.0",
-  "type": "commonjs",
+  "private": true,
   "main": "server.js",
+  "type": "commonjs",
   "scripts": {
     "start": "node server.js"
   },
