@@ -1,6 +1,4 @@
 const express = require("express");
-const fs = require("fs");
-const path = require("path");
 const { chromium } = require("playwright");
 
 const app = express();
@@ -9,49 +7,56 @@ app.use(express.json({ limit: "2mb" }));
 const API_KEY = process.env.EXPORT_SERVICE_API_KEY || "";
 
 function requireKey(req, res, next) {
-  if (!API_KEY) return next();
+  if (!API_KEY) return next(); // se não setou no Render, não bloqueia
   const sent = req.header("x-api-key");
   if (!sent || sent !== API_KEY) return res.status(401).json({ error: "Unauthorized" });
   next();
 }
 
 function parseBRDate(s) {
-  // "2025-12-01" ou "01/12/2025"
+  // aceita "2025-12-01" ou "01/12/2025"
   if (!s) return null;
   if (s.includes("/")) {
-    const [dd, mm, yyyy] = s.split("/").map((x) => Number(x));
+    const [dd, mm, yyyy] = s.split("/").map((v) => Number(v));
     return { dd, mm, yyyy };
   }
-  const [yyyy, mm, dd] = s.split("-").map((x) => Number(x));
+  const [yyyy, mm, dd] = s.split("-").map((v) => Number(v));
   return { dd, mm, yyyy };
 }
 
-const MONTH_MAP = {
-  JAN: 1, FEV: 2, MAR: 3, ABR: 4, MAI: 5, JUN: 6,
-  JUL: 7, AGO: 8, SET: 9, OUT: 10, NOV: 11, DEZ: 12,
-};
+function monthAbbrToNumber(upper) {
+  const monthMap = {
+    JAN: 1, FEV: 2, MAR: 3, ABR: 4, MAI: 5, JUN: 6,
+    JUL: 7, AGO: 8, SET: 9, OUT: 10, NOV: 11, DEZ: 12,
+  };
+  const m = upper.match(/(JAN|FEV|MAR|ABR|MAI|JUN|JUL|AGO|SET|OUT|NOV|DEZ)\.?\s+DE\s+(\d{4})/);
+  if (!m) return null;
+  return { mm: monthMap[m[1]], yyyy: Number(m[2]) };
+}
 
-async function gotoMonth(page, root, targetMonth, targetYear) {
-  // root = container do datepicker (a coluna do início ou do término)
-  const target = new Date(targetYear, targetMonth - 1, 1);
+async function setDateInPickerColumn(page, columnTitle, dateObj) {
+  // columnTitle: "Data de início" ou "Data de término"
+  const { dd, mm, yyyy } = dateObj;
+  const target = new Date(yyyy, mm - 1, 1);
+
+  const col = page.locator(`text=${columnTitle}`).first().locator(".."); // container da coluna
+  await col.waitFor({ state: "visible", timeout: 60000 });
+
+  // tenta achar o header do mês/ano dentro da coluna (ex: "JAN. DE 2026")
+  const header = col.locator('text=/((JAN|FEV|MAR|ABR|MAI|JUN|JUL|AGO|SET|OUT|NOV|DEZ)\\.?\\s+DE\\s+\\d{4})/').first();
+  await header.waitFor({ state: "visible", timeout: 60000 });
+
+  // setinhas próximas da coluna (tentamos achar botões clicáveis perto do header)
+  const nextBtn = col.locator('button:has-text("›"), button:has-text(">")').first();
+  const prevBtn = col.locator('button:has-text("‹"), button:has-text("<")').first();
 
   for (let i = 0; i < 36; i++) {
-    const header = root.locator("text=/[A-Z]{3}\\.?(\\s+DE)?\\s+\\d{4}/").first();
-    const headerText = ((await header.textContent().catch(() => "")) || "").toUpperCase();
+    const text = ((await header.textContent()) || "").toUpperCase();
+    const curMY = monthAbbrToNumber(text);
+    if (!curMY) break;
 
-    const m = headerText.match(/([A-Z]{3})\.?\s*(DE\s*)?(\d{4})/);
-    if (!m) break;
-
-    const curMonth = MONTH_MAP[m[1]];
-    const curYear = Number(m[3]);
-    if (!curMonth || !curYear) break;
-
-    const cur = new Date(curYear, curMonth - 1, 1);
-    if (cur.getTime() === target.getTime()) return true;
-
-    // setinhas do calendário (você mostrou no print)
-    const nextBtn = root.locator('button:has-text("›"), button:has-text(">")').first();
-    const prevBtn = root.locator('button:has-text("‹"), button:has-text("<")').first();
+    const cur = new Date(curMY.yyyy, curMY.mm - 1, 1);
+    if (cur.getTime() === target.getTime()) break;
 
     if (cur < target) {
       if (await nextBtn.count()) await nextBtn.click();
@@ -62,36 +67,12 @@ async function gotoMonth(page, root, targetMonth, targetYear) {
     }
     await page.waitForTimeout(250);
   }
-  return false;
-}
 
-async function setDateInPicker(page, labelText, dateObj) {
-  // labelText: "Data de início" ou "Data de término"
-  const { dd, mm, yyyy } = dateObj;
-
-  const label = page.locator(`text=${labelText}`).first();
-  await label.waitFor({ state: "visible", timeout: 60000 });
-
-  // pega a COLUNA do datepicker correspondente ao label
-  // (normalmente o label está dentro do container da coluna)
-  const col = label.locator("xpath=ancestor::div[contains(@class,'md-datepicker') or contains(@class,'date')][1]")
-    .first();
-
-  // fallback: sobe alguns níveis se o acima não existir
-  const root = (await col.count()) ? col : label.locator("xpath=ancestor::div[1]").first();
-
-  await gotoMonth(page, root, mm, yyyy);
-
-  // clica no dia (no seu print o dia é clicável)
-  // tenta como botão; se não, tenta texto simples dentro da coluna
-  const dayBtn = root.locator(`button:has-text("${dd}")`).first();
-  if (await dayBtn.count()) {
-    await dayBtn.click({ timeout: 20000 });
-  } else {
-    await root.locator(`text="${dd}"`).first().click({ timeout: 20000 });
-  }
-
-  await page.waitForTimeout(200);
+  // clicar no dia (dentro da coluna)
+  // IMPORTANT: usamos :has-text e filtramos por elemento clicável
+  const day = col.locator(`button:has-text("${dd}"), td:has-text("${dd}"), div:has-text("${dd}")`).first();
+  await day.click({ timeout: 30000 });
+  await page.waitForTimeout(250);
 }
 
 async function exportLookerPDF({ looker_url, client_name, start_date, end_date }) {
@@ -102,58 +83,44 @@ async function exportLookerPDF({ looker_url, client_name, start_date, end_date }
 
   const context = await browser.newContext({
     acceptDownloads: true,
-    viewport: { width: 1440, height: 900 },
-    locale: "pt-BR",
+    viewport: { width: 1400, height: 900 },
   });
 
   const page = await context.newPage();
 
-  // helper: screenshot para debug quando der ruim
-  const debugShot = async (name) => {
-    try {
-      const p = `/tmp/${name}.png`;
-      await page.screenshot({ path: p, fullPage: true });
-      return p;
-    } catch {
-      return null;
-    }
-  };
-
   try {
-    // 1) abrir
+    // 1) abrir relatório
     await page.goto(looker_url, { waitUntil: "domcontentloaded", timeout: 120000 });
     await page.waitForTimeout(2500);
 
-    // 2) abrir filtro "Conta de Anúncio"
-    const filtroConta = page.locator('text=Conta de Anúncio').first();
-    await filtroConta.waitFor({ state: "visible", timeout: 90000 });
-    await filtroConta.click({ timeout: 60000 });
-    await page.waitForTimeout(600);
+    // 2) abrir filtro Conta de Anúncio
+    await page.locator("text=Conta de Anúncio").first().click({ timeout: 60000 });
+    await page.waitForTimeout(800);
 
-    // 3) desmarcar todas (checkbox do topo do dropdown)
-    // no seu HTML aparece md-checkbox com input type checkbox
-    const topCheckboxInput = page.locator("md-virtual-repeat-container md-checkbox input[type='checkbox']").first();
-    if (await topCheckboxInput.count()) {
-      await topCheckboxInput.click({ timeout: 20000 });
+    // 3) desmarcar todas (checkbox do topo)
+    // no seu print é um checkbox no topo esquerdo do dropdown
+    const topCheckbox = page.locator("md-checkbox input[type='checkbox']").first();
+    if (await topCheckbox.count()) {
+      await topCheckbox.click({ timeout: 20000 });
     } else {
-      // fallback: clica no md-checkbox do topo
-      await page.locator("md-virtual-repeat-container md-checkbox").first().click({ timeout: 20000 });
+      await page.locator("md-checkbox").first().click({ timeout: 20000 });
     }
-    await page.waitForTimeout(400);
+    await page.waitForTimeout(700);
 
-    // 4) buscar e selecionar o cliente
+    // 4) pesquisar e selecionar cliente
     const search = page.locator('input[placeholder*="Digite"]').first();
     if (await search.count()) {
-      await search.fill(client_name);
-      await page.waitForTimeout(500);
+      await search.fill(client_name, { timeout: 20000 });
+      await page.waitForTimeout(800);
     }
 
-    // melhor seletor (você mostrou aria-label exatamente com o nome)
+    // tenta clicar no checkbox do item filtrado
+    // o aria-label geralmente é o nome completo
     const clientCheckbox = page.locator(`md-checkbox[aria-label="${client_name}"]`).first();
     if (await clientCheckbox.count()) {
       await clientCheckbox.click({ timeout: 20000 });
     } else {
-      // fallback por texto visível
+      // fallback: clica no texto
       await page.locator(`text=${client_name}`).first().click({ timeout: 20000 });
     }
 
@@ -161,68 +128,62 @@ async function exportLookerPDF({ looker_url, client_name, start_date, end_date }
     await page.keyboard.press("Escape").catch(() => {});
     await page.waitForTimeout(1200);
 
-    // 5) abrir período
+    // 5) abrir seletor de período
     await page.locator("text=Selecionar período").first().click({ timeout: 60000 });
-    await page.waitForTimeout(900);
+    await page.waitForTimeout(1000);
 
     // 6) setar datas
     const sd = parseBRDate(start_date);
     const ed = parseBRDate(end_date);
-    if (!sd || !ed) throw new Error("Datas inválidas: start_date/end_date");
+    if (!sd || !ed) throw new Error("Invalid dates");
 
-    await setDateInPicker(page, "Data de início", sd);
-    await setDateInPicker(page, "Data de término", ed);
+    await setDateInPickerColumn(page, "Data de início", sd);
+    await setDateInPickerColumn(page, "Data de término", ed);
 
     // aplicar
     await page.locator('button:has-text("Aplicar")').first().click({ timeout: 30000 });
 
-    // espera carregar dados (looker é lento mesmo)
+    // aguarda recalcular
     await page.waitForLoadState("networkidle", { timeout: 90000 }).catch(() => {});
-    await page.waitForTimeout(2500);
+    await page.waitForTimeout(2000);
 
-    // 7) menu 3 pontinhos (kebab)
-    // no seu print é um botão com ícone e abre menu com "Baixar o relatório"
-    const kebab = page.locator("button:has(svg)").filter({ hasText: "" }).first();
-    await kebab.click({ timeout: 30000 }).catch(async () => {
-      // fallback: tenta achar pelo mat-icon/menu
-      await page.locator("button[aria-label*='Mais'], button[aria-label*='menu']").first().click({ timeout: 30000 });
+    // 7) menu de 3 pontos (kebab) e baixar relatório
+    // tenta pegar pelo botão com ícone (bem no topo)
+    const menuBtn = page.locator('button:has(svg), button[aria-label*="Mais"]').first();
+    await menuBtn.click({ timeout: 30000 }).catch(async () => {
+      // fallback posição aproximada (ajuste se precisar)
+      await page.mouse.click(1130, 150);
     });
 
     await page.waitForTimeout(600);
-
-    // 8) clicar "Baixar o relatório"
     await page.locator("text=Baixar o relatório").first().click({ timeout: 30000 });
 
-    // 9) modal "Fazer download do relatório (PDF)"
+    // 8) modal do download + botão "Fazer download" (esperar habilitar)
     const downloadBtn = page.locator('button:has-text("Fazer download")').first();
     await downloadBtn.waitFor({ state: "visible", timeout: 90000 });
 
-    // espera habilitar (no seu print fica cinza um tempo)
-    for (let i = 0; i < 200; i++) {
+    // espera habilitar
+    for (let i = 0; i < 180; i++) {
       const disabled = await downloadBtn.isDisabled().catch(() => true);
       if (!disabled) break;
       await page.waitForTimeout(500);
     }
 
-    const downloadPromise = page.waitForEvent("download", { timeout: 120000 });
+    const downloadPromise = page.waitForEvent("download", { timeout: 180000 });
     await downloadBtn.click({ timeout: 30000 });
     const download = await downloadPromise;
 
-    const outPath = `/tmp/report-${Date.now()}.pdf`;
-    await download.saveAs(outPath);
+    const path = await download.path();
+    const fs = require("fs");
+    const buffer = fs.readFileSync(path);
 
-    const buffer = fs.readFileSync(outPath);
     return buffer;
-  } catch (err) {
-    const shot = await debugShot("debug_error");
-    const detail = `${err?.message || err}`;
-    const extra = shot ? ` | screenshot: ${shot}` : "";
-    throw new Error(detail + extra);
   } finally {
-    await context.close().catch(() => {});
-    await browser.close().catch(() => {});
+    await browser.close();
   }
 }
+
+app.get("/health", (req, res) => res.status(200).send("ok"));
 
 app.post("/export", requireKey, async (req, res) => {
   try {
@@ -231,7 +192,7 @@ app.post("/export", requireKey, async (req, res) => {
     if (!looker_url || !client_name || !start_date || !end_date) {
       return res.status(400).json({
         error: "Missing looker_url, client_name, start_date, end_date",
-        got: { looker_url: !!looker_url, client_name: !!client_name, start_date: !!start_date, end_date: !!end_date },
+        received: { looker_url: !!looker_url, client_name: !!client_name, start_date: !!start_date, end_date: !!end_date },
       });
     }
 
@@ -239,10 +200,10 @@ app.post("/export", requireKey, async (req, res) => {
 
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader("Content-Disposition", 'attachment; filename="report.pdf"');
-    return res.status(200).send(pdf);
+    res.status(200).send(pdf);
   } catch (e) {
     console.error(e);
-    return res.status(500).json({ error: "Failed to export PDF", detail: String(e?.message || e) });
+    res.status(500).json({ error: "Failed to export PDF", detail: String(e?.message || e) });
   }
 });
 
